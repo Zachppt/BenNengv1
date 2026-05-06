@@ -1,0 +1,47 @@
+# ============================================================
+# config.yaml — OpenClaw 调度配置
+# ============================================================
+
+# ── cron job（定时任务）──
+cron_jobs:
+
+  - name: anomaly-scanner
+    schedule: "*/15 * * * *"
+    command: "python /scanner/main.py --once"
+    description: "每 15 分钟执行一次全市场扫描"
+    timeout_seconds: 120
+
+  - name: oi-baseline-updater
+    schedule: "0 2 * * *"
+    command: "python /scanner/main.py --update-baseline"
+    description: "每日凌晨 2 点更新 OI 历史基线（30 天）"
+    timeout_seconds: 300
+
+  - name: cache-cleaner
+    schedule: "0 3 * * *"
+    command: "python /scanner/cache/snapshot.py --clean"
+    description: "每日凌晨 3 点清理过期快照"
+    timeout_seconds: 60
+
+  - name: heartbeat
+    schedule: "0 * * * *"
+    command: "python /scanner/main.py --heartbeat"
+    description: "每小时推送系统状态心跳"
+    timeout_seconds: 30
+
+# ── 启动任务 ──
+startup:
+  - command: "python /scanner/run.py"
+    description: "系统启动时运行持续扫描进程（后台）"
+
+# ── 共享存储路径 ──
+shared_paths:
+  scan_result:  "./shared/scan_result.json"
+  alert_state:  "./shared/alert_state.json"
+  snapshots_db: "./shared/snapshots.db"
+
+# ── Skill 路径 ──
+skills:
+  - path: "./skills/crypto-anomaly-scanner"
+  - path: "./skills/crypto-anomaly-scanner/skills/token-analyzer"
+  - path: "./skills/crypto-anomaly-scanner/skills/alert-manager"
