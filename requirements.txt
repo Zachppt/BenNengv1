@@ -1,0 +1,2 @@
+aiohttp>=3.9.0
+# sqlite3 is Python standard library, no install needed
