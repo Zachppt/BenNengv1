@@ -1,6 +1,6 @@
 # ============================================================
-# main.py — 主扫描循环 v2
-# 新增：现货价格采集、基差计算、新操纵模式检测
+# main.py — v3
+# 相对强度过滤 + 概率制推送
 # ============================================================
 
 import asyncio
@@ -13,25 +13,23 @@ import logging
 import statistics
 
 from config import (
-    SCAN_INTERVAL_MINUTES, HFREQ_INTERVAL_MINUTES,
-    COLDSTART_SNAPSHOTS, FILTER, ALERT_THRESHOLD,
-    DEDUP_MINUTES, NOISE_THRESHOLD,
+    SCAN_INTERVAL_MINUTES, COLDSTART_SNAPSHOTS,
+    FILTER, ALERT_PROBABILITY, DEDUP_MINUTES,
+    NOISE_THRESHOLD, RELATIVE_STRENGTH_THRESHOLD,
     SCAN_RESULT_PATH, ALERT_STATE_PATH, SHARED_DIR,
 )
-from data.fetcher import (
-    fetch_all_prices, fetch_token_full, fetch_token_realtime
-)
+from data.fetcher import fetch_all_prices, fetch_token_full, fetch_token_realtime
 from cache.snapshot import (
     init_db, build_exchange_snapshot, save_snapshot_batch,
     save_phase, save_alert, can_push, record_push,
-    get_snapshots, is_coldstart_done, get_previous_phase,
-    save_oi_baseline, build_history_summary,
+    get_snapshots, is_coldstart_done,
 )
-from rules.engine import RuleEngine, aggregate
+from rules.engine import RuleEngine, aggregate, prob_to_level
 from alerts.telegram import (
-    send, fmt_high_alert, fmt_medium_batch,
+    send, send_photo, fmt_high_alert, fmt_medium_batch,
     fmt_scan_summary, fmt_system,
 )
+from alerts.chart_generator import generate_kline_chart
 
 logging.basicConfig(
     level=logging.INFO,
@@ -50,17 +48,17 @@ _last_baseline_update = 0
 
 
 # ============================================================
-# 共享存储读写
+# 共享存储
 # ============================================================
 
 def ensure_shared_dir():
     os.makedirs(SHARED_DIR, exist_ok=True)
 
 
-def write_scan_result(result_data: dict):
+def write_scan_result(data: dict):
     ensure_shared_dir()
     with open(SCAN_RESULT_PATH, "w", encoding="utf-8") as f:
-        json.dump(result_data, f, ensure_ascii=False, indent=2)
+        json.dump(data, f, ensure_ascii=False, indent=2)
 
 
 def read_alert_state() -> dict:
@@ -79,24 +77,28 @@ def write_alert_state(state: dict):
 
 def is_muted(token: str) -> bool:
     state = read_alert_state()
-    muted_until = state.get("muted", {}).get(token, 0)
-    return time.time() < muted_until
+    return time.time() < state.get("muted", {}).get(token, 0)
 
 
 # ============================================================
-# 第一层过滤
+# 第一层过滤（加入相对BTC超额涨幅）
 # ============================================================
 
 async def layer1_filter(session: aiohttp.ClientSession) -> list:
-    """
-    拉取全量合约价格，筛选出候选代币
-    条件：4h 价格变动 > 5% 或在高频监控列表中
-    """
     logger.info("第一层过滤：拉取全市场价格...")
     all_prices = await fetch_all_prices(session)
     if not all_prices:
         logger.error("全市场价格拉取失败")
         return []
+
+    # 获取BTC 4h变化（作为市场基准）
+    btc_change = 0
+    btc_snaps  = get_snapshots("BTC", "binance", limit=17)
+    if len(btc_snaps) >= 16:
+        btc_old = btc_snaps[-1].get("price", 0)
+        btc_now = all_prices.get("BTCUSDT", 0)
+        if btc_old > 0 and btc_now > 0:
+            btc_change = (btc_now - btc_old) / btc_old
 
     candidates = []
 
@@ -105,73 +107,64 @@ async def layer1_filter(session: aiohttp.ClientSession) -> list:
             continue
         token = symbol.replace("USDT", "")
 
-        # 已在高频监控列表：直接加入
         if token in hfreq_tokens:
             candidates.append({"token": token, "price": price,
                                 "reason": "高频监控"})
             continue
 
-        # 与 4h 前快照对比
         snaps = get_snapshots(token, "binance", limit=17)
         if len(snaps) >= 16:
             old_price = snaps[-1].get("price", 0)
             if old_price > 0:
-                change = abs((price - old_price) / old_price)
-                if change > FILTER["price_change_4h"]:
+                change = (price - old_price) / old_price
+
+                # 绝对涨幅过滤
+                if abs(change) > FILTER["price_change_4h"]:
+                    # 相对BTC超额涨幅
+                    excess = change - btc_change
                     candidates.append({
-                        "token":  token,
-                        "price":  price,
-                        "change": change,
-                        "reason": f"4h变动{change*100:.1f}%",
+                        "token":      token,
+                        "price":      price,
+                        "change":     change,
+                        "excess":     excess,
+                        "reason":     f"4h{change*100:+.1f}% (超额{excess*100:+.1f}%)",
                     })
         else:
-            # 快照不足（新代币或系统刚启动）：加入候选
             candidates.append({"token": token, "price": price,
-                                "reason": "新代币/快照不足"})
+                                "reason": "新代币"})
 
-    logger.info(
-        f"第一层过滤：{len(all_prices)}个合约 → {len(candidates)}个候选"
-    )
+    logger.info(f"第一层过滤：{len(all_prices)}个合约 → {len(candidates)}个候选")
     return candidates
 
 
 # ============================================================
-# 第二层：单币完整数据采集 + 规则计算
+# 第二层：单币采集 + 规则计算
 # ============================================================
 
 async def process_token(session: aiohttp.ClientSession,
-                        token: str) -> dict | None:
-    """
-    采集单个代币的完整数据（合约 + 现货），
-    运行规则引擎，存入快照，返回结果
-    """
+                         token: str) -> dict | None:
     try:
         raw = await fetch_token_full(session, token)
         if not raw:
             return None
 
-        # 聚合数据（含基差计算）
         agg = aggregate(token, raw)
 
-        # 存入快照
+        # 存快照
         exchange_data = build_exchange_snapshot(token, raw, agg)
         save_snapshot_batch(token, exchange_data)
 
-        # 运行规则引擎
         cold_done = is_coldstart_done(token, COLDSTART_SNAPSHOTS)
-        result = engine.run(
+        result    = engine.run(
             token, agg,
             snapshot_fn=get_snapshots,
             coldstart_done=cold_done,
         )
 
-        # 保存阶段和告警记录
-        if result["score"] >= ALERT_THRESHOLD["WATCH"]:
+        if result["probability"] >= ALERT_PROBABILITY["WATCH"]:
             save_phase(token, result["phase"])
-            save_alert(
-                token, result["score"], result["level"],
-                result["phase"], result["triggered"]
-            )
+            save_alert(token, result["score"], result["level"],
+                       result["phase"], result["triggered"])
 
         return result
 
@@ -181,14 +174,50 @@ async def process_token(session: aiohttp.ClientSession,
 
 
 # ============================================================
-# 噪音过滤
+# 相对强度过滤（核心新增）
 # ============================================================
 
-def filter_noise(all_results: list) -> list:
+def relative_strength_filter(all_results: list) -> list:
     """
-    超过 NOISE_THRESHOLD 个代币触发同一规则
-    → 该规则本轮静默（市场整体行情，非单币操纵）
+    只推送明显超出市场均值的代币
+    解决"全市场同时触发"的误报问题
     """
+    if not all_results:
+        return []
+
+    probs = [r["probability"] for r in all_results]
+    market_avg = statistics.mean(probs)
+
+    logger.info(f"市场平均上涨概率：{market_avg*100:.1f}%")
+
+    filtered = []
+    for r in all_results:
+        prob      = r["probability"]
+        relative  = prob / market_avg if market_avg > 0 else 1
+
+        # 必须超出市场均值1.5倍 或 绝对概率>75%
+        if (relative >= RELATIVE_STRENGTH_THRESHOLD
+                or prob >= ALERT_PROBABILITY["HIGH"]):
+            filtered.append({**r, "market_avg": market_avg,
+                              "relative_strength": relative})
+        elif prob >= ALERT_PROBABILITY["MEDIUM"]:
+            # MEDIUM只要超出均值1.2倍
+            if relative >= 1.2:
+                filtered.append({**r, "market_avg": market_avg,
+                                  "relative_strength": relative})
+
+    logger.info(
+        f"相对强度过滤：{len(all_results)}个 → {len(filtered)}个"
+        f"（均值{market_avg*100:.1f}%，阈值{RELATIVE_STRENGTH_THRESHOLD}x）"
+    )
+    return filtered, market_avg
+
+
+# ============================================================
+# 噪音过滤（保留，提高阈值）
+# ============================================================
+
+def noise_filter(all_results: list) -> list:
     from collections import Counter
     rule_counts = Counter(
         r["rule"]
@@ -197,47 +226,21 @@ def filter_noise(all_results: list) -> list:
     )
     noise_rules = {
         rule for rule, cnt in rule_counts.items()
-        if cnt > NOISE_THRESHOLD
+        if cnt > NOISE_THRESHOLD   # 已在config.py调高到40
     }
     if noise_rules:
-        logger.info(f"噪音规则过滤: {noise_rules}")
+        logger.info(f"噪音规则过滤({len(noise_rules)}条): {list(noise_rules)[:5]}...")
 
     filtered = []
     for res in all_results:
         clean = [r for r in res["triggered"]
                  if r["rule"] not in noise_rules]
-        score = sum(r["score"] for r in clean)
-        if score >= ALERT_THRESHOLD["WATCH"]:
-            level = ("HIGH"   if score >= ALERT_THRESHOLD["HIGH"]
-                     else "MEDIUM" if score >= ALERT_THRESHOLD["MEDIUM"]
-                     else "WATCH")
-            filtered.append({**res, "triggered": clean,
-                             "score": score, "level": level})
+        from rules.engine import calc_probability, prob_to_level
+        prob  = calc_probability(clean)
+        level = prob_to_level(prob)
+        filtered.append({**res, "triggered": clean,
+                         "probability": prob, "level": level})
     return filtered
-
-
-# ============================================================
-# OI 基线更新（每日一次）
-# ============================================================
-
-async def update_oi_baselines(session: aiohttp.ClientSession,
-                               tokens: list):
-    global _last_baseline_update
-    if time.time() - _last_baseline_update < 86400:
-        return
-    logger.info("更新 OI 历史基线...")
-    from data.fetcher import BinanceFuturesFetcher
-    bf = BinanceFuturesFetcher()
-    for token in tokens[:30]:
-        hist = await bf.oi_history(session, token + "USDT")
-        if hist and len(hist) >= 10:
-            vals = [h["oi_usd"] for h in hist if h["oi_usd"] > 0]
-            if vals:
-                mean = statistics.mean(vals)
-                std  = statistics.stdev(vals) if len(vals) > 1 else mean * 0.1
-                save_oi_baseline(token, "binance", mean, std)
-    _last_baseline_update = time.time()
-    logger.info("OI 基线更新完成")
 
 
 # ============================================================
@@ -251,20 +254,13 @@ async def run_scan():
 
     async with aiohttp.ClientSession() as session:
 
-        # 第一层过滤
         candidates = await layer1_filter(session)
         if not candidates:
             logger.warning("候选池为空，跳过")
             return
 
-        # 后台更新 OI 基线
-        asyncio.create_task(
-            update_oi_baselines(session,
-                                [c["token"] for c in candidates])
-        )
-
-        # 第二层：并发采集（每批 20 个）
-        logger.info(f"第二层深度采集：{len(candidates)} 个代币...")
+        # 并发采集（每批20个）
+        logger.info(f"第二层深度采集：{len(candidates)}个代币...")
         all_results = []
         BATCH = 20
 
@@ -275,113 +271,123 @@ async def run_scan():
 
             for res in results:
                 if isinstance(res, dict) and res:
-                    all_results.append(res)
-                    if res["score"] >= ALERT_THRESHOLD["WATCH"]:
+                    prob = res.get("probability", 0)
+                    if prob >= ALERT_PROBABILITY["WATCH"]:
+                        all_results.append(res)
                         logger.info(
-                            f"{res['token']}: 评分{res['score']} "
+                            f"{res['token']}: {prob*100:.0f}% "
                             f"{res['level']} {res['phase']}"
                         )
 
             if i + BATCH < len(candidates):
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(1.0)   # 增加间隔，减少418
 
         # 噪音过滤
-        filtered = filter_noise(all_results)
+        all_results = noise_filter(all_results)
+
+        # 相对强度过滤
+        filtered_result = relative_strength_filter(all_results)
+        if isinstance(filtered_result, tuple):
+            filtered, market_avg = filtered_result
+        else:
+            filtered, market_avg = filtered_result, 0
 
         # 分级
-        high_results   = [r for r in filtered if r["level"] == "HIGH"]
-        medium_results = [r for r in filtered if r["level"] == "MEDIUM"]
+        high_results   = [r for r in filtered
+                          if r["probability"] >= ALERT_PROBABILITY["HIGH"]]
+        medium_results = [r for r in filtered
+                          if ALERT_PROBABILITY["MEDIUM"] <= r["probability"]
+                          < ALERT_PROBABILITY["HIGH"]]
 
         # 更新高频监控列表
         hfreq_tokens.clear()
         for r in filtered:
-            if r["score"] >= ALERT_THRESHOLD["MEDIUM"]:
+            if r["probability"] >= ALERT_PROBABILITY["MEDIUM"]:
                 hfreq_tokens.add(r["token"])
 
-        # 写入共享存储（供 OpenClaw Skill 读取）
-        scan_result = {
+        # 写共享存储
+        write_scan_result({
             "scan_ts":      int(time.time()),
-            "scan_id":      int(time.time()),
             "duration_sec": time.time() - scan_start,
             "total_scanned":len(candidates),
+            "market_avg_prob": market_avg,
             "high_alerts": [
-                {
-                    "token":     r["token"],
-                    "score":     r["score"],
-                    "level":     r["level"],
-                    "phase":     r["phase"],
-                    "triggered": r["triggered"][:10],
-                    "pushed":    False,
-                }
+                {"token": r["token"], "probability": r["probability"],
+                 "level": r["level"], "phase": r["phase"],
+                 "triggered": r["triggered"][:8], "pushed": False}
                 for r in high_results
             ],
             "medium_alerts": [
-                {
-                    "token": r["token"],
-                    "score": r["score"],
-                    "phase": r["phase"],
-                    "pushed": False,
-                }
+                {"token": r["token"], "probability": r["probability"],
+                 "phase": r["phase"], "pushed": False}
                 for r in medium_results
             ],
             "system": {
                 "coldstart_done": is_coldstart_done(
                     candidates[0]["token"] if candidates else "BTC",
-                    COLDSTART_SNAPSHOTS
-                ),
+                    COLDSTART_SNAPSHOTS),
                 "hfreq_tokens": list(hfreq_tokens),
                 "next_scan_ts": int(time.time() + SCAN_INTERVAL_MINUTES * 60),
             }
-        }
-        write_scan_result(scan_result)
+        })
 
-        # ── 推送 HIGH ALERT ──
+        # ── 推送 HIGH（含K线图）──
         for r in sorted(high_results,
-                         key=lambda x: x["score"], reverse=True):
+                         key=lambda x: x["probability"], reverse=True):
             token = r["token"]
-            score = r["score"]
-            if is_muted(token):
-                logger.info(f"{token} 已静默，跳过推送")
-                continue
-            if can_push(token, "HIGH", score, DEDUP_MINUTES["HIGH"]):
-                # 计算首次异动时间
-                first_ago = _calc_first_alert_ago(token)
-                msg = fmt_high_alert(r, first_ago)
-                ok  = await send(msg)
-                if ok:
-                    record_push(token, "HIGH", score)
-                    logger.info(f"✅ 推送 HIGH: {token} 评分{score}")
+            prob  = r["probability"]
 
-        # ── 推送 MEDIUM ALERT（批量）──
+            if is_muted(token):
+                continue
+            if not can_push(token, "HIGH", int(prob*100),
+                            DEDUP_MINUTES["HIGH"]):
+                continue
+
+            # 先推送文字预警
+            first_ago = _calc_first_alert_ago(token)
+            msg = fmt_high_alert(r, first_ago)
+            ok  = await send(msg)
+
+            # 再推送K线图
+            ka = r["agg"].get("kline_analysis", {}).get("binance", {})
+            klines = (r["agg"].get("raw", {}).get("binance", {})
+                      .get("futures", {}).get("klines") or [])
+            if klines and ka:
+                ka["probability"] = prob
+                chart_bytes = generate_kline_chart(
+                    token, klines, ka, r.get("entry_zone", {})
+                )
+                if chart_bytes:
+                    await send_photo(chart_bytes,
+                                     caption=f"{token}/USDT K线图")
+
+            if ok:
+                record_push(token, "HIGH", int(prob*100))
+                logger.info(f"✅ 推送HIGH: {token} {prob*100:.0f}%")
+
+        # ── 推送 MEDIUM（批量）──
         medium_to_push = [
             r for r in sorted(medium_results,
-                               key=lambda x: x["score"], reverse=True)
+                               key=lambda x: x["probability"], reverse=True)
             if (not is_muted(r["token"])
                 and can_push(r["token"], "MEDIUM",
-                             r["score"], DEDUP_MINUTES["MEDIUM"]))
+                             int(r["probability"]*100),
+                             DEDUP_MINUTES["MEDIUM"]))
         ]
         if medium_to_push:
             msg = fmt_medium_batch(medium_to_push)
             ok  = await send(msg)
             if ok:
                 for r in medium_to_push:
-                    record_push(r["token"], "MEDIUM", r["score"])
-                logger.info(f"✅ 推送 MEDIUM: {len(medium_to_push)} 个代币")
+                    record_push(r["token"], "MEDIUM",
+                                int(r["probability"]*100))
 
-        # ── 冷启动状态 ──
+        # ── 扫描总结 ──
+        elapsed = time.time() - scan_start
         cold_tokens = [
             c["token"] for c in candidates
             if not is_coldstart_done(c["token"], COLDSTART_SNAPSHOTS)
         ]
-
-        # ── TWAP 检测激活通知（仅一次）──
-        elapsed_min = (time.time() - START_TIME) / 60
-        if (int(elapsed_min) == COLDSTART_SNAPSHOTS * SCAN_INTERVAL_MINUTES
-                and elapsed_min < COLDSTART_SNAPSHOTS * SCAN_INTERVAL_MINUTES + 1):
-            await send(fmt_system("twap_ready"))
-
-        # ── 扫描总结 ──
-        elapsed = time.time() - scan_start
         summary = fmt_scan_summary(
             high=len(high_results),
             medium=len(medium_results),
@@ -389,17 +395,18 @@ async def run_scan():
             elapsed=elapsed,
             next_min=SCAN_INTERVAL_MINUTES,
             coldstart_tokens=cold_tokens[:3] if cold_tokens else None,
+            market_avg_prob=market_avg,
         )
         await send(summary)
 
         logger.info(
             f"扫描完成：{elapsed:.1f}秒 "
-            f"HIGH={len(high_results)} MEDIUM={len(medium_results)}"
+            f"HIGH={len(high_results)} MEDIUM={len(medium_results)} "
+            f"市场均值={market_avg*100:.1f}%"
         )
 
 
 def _calc_first_alert_ago(token: str) -> int:
-    """计算该代币首次触发异动距今多少分钟"""
     from cache.snapshot import get_alert_history
     history = get_alert_history(token, hours=24)
     if not history:
@@ -419,48 +426,28 @@ async def main():
     args = sys.argv[1:]
 
     if "--once" in args:
-        # cron job 模式：执行一次扫描
         await run_scan()
 
-    elif "--update-baseline" in args:
-        # OI 基线更新模式
-        global _last_baseline_update
-        _last_baseline_update = 0
-        async with aiohttp.ClientSession() as session:
-            from cache.snapshot import get_snapshots as gs
-            conn = __import__("sqlite3").connect(
-                __import__("config").DB_PATH
-            )
-            c = conn.cursor()
-            c.execute("SELECT DISTINCT token FROM snapshots")
-            tokens = [row[0] for row in c.fetchall()]
-            conn.close()
-            await update_oi_baselines(session, tokens)
-
     elif "--heartbeat" in args:
-        # 心跳模式
         state = read_alert_state()
         hfreq = state.get("hfreq_tokens", [])
-        msg = fmt_system(
+        await send(fmt_system(
             "heartbeat",
             f"高频监控: {', '.join(hfreq) if hfreq else '无'}"
-        )
-        await send(msg)
+        ))
 
     else:
-        # 持续运行模式（默认）
-        logger.info("妖币监控系统启动（持续运行模式）")
+        logger.info("上涨预警系统启动（持续运行模式）")
         await send(fmt_system(
             "startup",
             f"扫描间隔 {SCAN_INTERVAL_MINUTES} 分钟\n"
-            f"冷启动期 {COLDSTART_SNAPSHOTS * SCAN_INTERVAL_MINUTES} 分钟"
+            f"相对强度过滤：市场均值 {RELATIVE_STRENGTH_THRESHOLD}x\n"
+            f"噪音阈值：{NOISE_THRESHOLD} 个代币"
         ))
 
-        scan_count = 0
         while True:
             try:
                 await run_scan()
-                scan_count += 1
             except Exception as e:
                 logger.exception(f"扫描异常: {e}")
                 await send(fmt_system("error", str(e)))
